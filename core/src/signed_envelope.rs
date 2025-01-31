@@ -1,11 +1,13 @@
-use crate::identity::error::SigningError;
-use crate::identity::Keypair;
-use crate::{identity, DecodeError, PublicKey};
-use std::convert::TryInto;
 use std::fmt;
+
+use libp2p_identity::{Keypair, PublicKey, SigningError};
+use quick_protobuf::{BytesReader, Writer};
 use unsigned_varint::encode::usize_buffer;
 
-/// A signed envelope contains an arbitrary byte string payload, a signature of the payload, and the public key that can be used to verify the signature.
+use crate::{proto, DecodeError};
+
+/// A signed envelope contains an arbitrary byte string payload, a signature of the payload, and the
+/// public key that can be used to verify the signature.
 ///
 /// For more details see libp2p RFC0002: <https://github.com/libp2p/specs/blob/master/RFC/0002-signed-envelopes.md>
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,8 +48,9 @@ impl SignedEnvelope {
 
     /// Extract the payload and signing key of this [`SignedEnvelope`].
     ///
-    /// You must provide the correct domain-separation string and expected payload type in order to get the payload.
-    /// This guards against accidental mis-use of the payload where the signature was created for a different purpose or payload type.
+    /// You must provide the correct domain-separation string and expected payload type in order to
+    /// get the payload. This guards against accidental mis-use of the payload where the
+    /// signature was created for a different purpose or payload type.
     ///
     /// It is the caller's responsibility to check that the signing key is what
     /// is expected. For example, checking that the signing key is from a
@@ -73,37 +76,37 @@ impl SignedEnvelope {
 
     /// Encode this [`SignedEnvelope`] using the protobuf encoding specified in the RFC.
     pub fn into_protobuf_encoding(self) -> Vec<u8> {
-        use prost::Message;
+        use quick_protobuf::MessageWrite;
 
-        let envelope = crate::envelope_proto::Envelope {
-            public_key: Some((&self.key).into()),
+        let envelope = proto::Envelope {
+            public_key: self.key.encode_protobuf(),
             payload_type: self.payload_type,
             payload: self.payload,
             signature: self.signature,
         };
 
-        let mut buf = Vec::with_capacity(envelope.encoded_len());
+        let mut buf = Vec::with_capacity(envelope.get_size());
+        let mut writer = Writer::new(&mut buf);
+
         envelope
-            .encode(&mut buf)
-            .expect("Vec<u8> provides capacity as needed");
+            .write_message(&mut writer)
+            .expect("Encoding to succeed");
 
         buf
     }
 
     /// Decode a [`SignedEnvelope`] using the protobuf encoding specified in the RFC.
     pub fn from_protobuf_encoding(bytes: &[u8]) -> Result<Self, DecodingError> {
-        use prost::Message;
+        use quick_protobuf::MessageRead;
 
-        let envelope = crate::envelope_proto::Envelope::decode(bytes).map_err(DecodeError)?;
+        let mut reader = BytesReader::from_bytes(bytes);
+        let envelope = proto::Envelope::from_reader(&mut reader, bytes).map_err(DecodeError)?;
 
         Ok(Self {
-            key: envelope
-                .public_key
-                .ok_or(DecodingError::MissingPublicKey)?
-                .try_into()?,
-            payload_type: envelope.payload_type,
-            payload: envelope.payload,
-            signature: envelope.signature,
+            key: PublicKey::try_decode_protobuf(&envelope.public_key)?,
+            payload_type: envelope.payload_type.to_vec(),
+            payload: envelope.payload.to_vec(),
+            signature: envelope.signature.to_vec(),
         })
     }
 }
@@ -147,7 +150,7 @@ pub enum DecodingError {
     InvalidEnvelope(#[from] DecodeError),
     /// The public key in the envelope could not be converted to our internal public key type.
     #[error("Failed to convert public key")]
-    InvalidPublicKey(#[from] identity::error::DecodingError),
+    InvalidPublicKey(#[from] libp2p_identity::DecodingError),
     /// The public key in the envelope could not be converted to our internal public key type.
     #[error("Public key is missing from protobuf struct")]
     MissingPublicKey,
@@ -156,7 +159,8 @@ pub enum DecodingError {
 /// Errors that occur whilst extracting the payload of a [`SignedEnvelope`].
 #[derive(Debug)]
 pub enum ReadPayloadError {
-    /// The signature on the signed envelope does not verify with the provided domain separation string.
+    /// The signature on the signed envelope does not verify
+    /// with the provided domain separation string.
     InvalidSignature,
     /// The payload contained in the envelope is not of the expected type.
     UnexpectedPayloadType { expected: Vec<u8>, got: Vec<u8> },
@@ -181,7 +185,7 @@ mod tests {
     use super::*;
 
     #[test]
-    pub fn test_roundtrip() {
+    fn test_roundtrip() {
         let kp = Keypair::generate_ed25519();
         let payload = "some payload".as_bytes();
         let domain_separation = "domain separation".to_string();

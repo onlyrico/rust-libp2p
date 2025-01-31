@@ -18,86 +18,67 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::message_proto::{stop_message, Status, StopMessage};
-use crate::protocol::{self, MAX_MESSAGE_SIZE, STOP_PROTOCOL_NAME};
+use std::io;
+
 use asynchronous_codec::{Framed, FramedParts};
 use bytes::Bytes;
-use futures::{future::BoxFuture, prelude::*};
-use libp2p_core::{upgrade, PeerId};
-use libp2p_swarm::NegotiatedSubstream;
-use std::iter;
+use futures::prelude::*;
+use libp2p_identity::PeerId;
+use libp2p_swarm::Stream;
 use thiserror::Error;
 
-pub struct Upgrade {}
+use crate::{
+    proto,
+    protocol::{self, MAX_MESSAGE_SIZE},
+};
 
-impl upgrade::UpgradeInfo for Upgrade {
-    type Info = &'static [u8];
-    type InfoIter = iter::Once<Self::Info>;
+pub(crate) async fn handle_open_circuit(io: Stream) -> Result<Circuit, Error> {
+    let mut substream = Framed::new(io, quick_protobuf_codec::Codec::new(MAX_MESSAGE_SIZE));
 
-    fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(STOP_PROTOCOL_NAME)
-    }
-}
+    let proto::StopMessage {
+        type_pb,
+        peer,
+        limit,
+        status: _,
+    } = substream
+        .next()
+        .await
+        .ok_or(Error::Io(io::ErrorKind::UnexpectedEof.into()))??;
 
-impl upgrade::InboundUpgrade<NegotiatedSubstream> for Upgrade {
-    type Output = Circuit;
-    type Error = UpgradeError;
-    type Future = BoxFuture<'static, Result<Self::Output, Self::Error>>;
-
-    fn upgrade_inbound(self, substream: NegotiatedSubstream, _: Self::Info) -> Self::Future {
-        let mut substream = Framed::new(substream, prost_codec::Codec::new(MAX_MESSAGE_SIZE));
-
-        async move {
-            let StopMessage {
-                r#type,
-                peer,
-                limit,
-                status: _,
-            } = substream
-                .next()
-                .await
-                .ok_or(FatalUpgradeError::StreamClosed)??;
-
-            let r#type =
-                stop_message::Type::from_i32(r#type).ok_or(FatalUpgradeError::ParseTypeField)?;
-            match r#type {
-                stop_message::Type::Connect => {
-                    let src_peer_id =
-                        PeerId::from_bytes(&peer.ok_or(FatalUpgradeError::MissingPeer)?.id)
-                            .map_err(|_| FatalUpgradeError::ParsePeerId)?;
-                    Ok(Circuit {
-                        substream,
-                        src_peer_id,
-                        limit: limit.map(Into::into),
-                    })
-                }
-                stop_message::Type::Status => Err(FatalUpgradeError::UnexpectedTypeStatus.into()),
-            }
+    match type_pb {
+        proto::StopMessageType::CONNECT => {
+            let src_peer_id = PeerId::from_bytes(&peer.ok_or(ProtocolViolation::MissingPeer)?.id)
+                .map_err(|_| ProtocolViolation::ParsePeerId)?;
+            Ok(Circuit {
+                substream,
+                src_peer_id,
+                limit: limit.map(Into::into),
+            })
         }
-        .boxed()
+        proto::StopMessageType::STATUS => {
+            Err(Error::Protocol(ProtocolViolation::UnexpectedTypeStatus))
+        }
     }
 }
 
 #[derive(Debug, Error)]
-pub enum UpgradeError {
-    #[error("Fatal")]
-    Fatal(#[from] FatalUpgradeError),
+pub(crate) enum Error {
+    #[error("Protocol error")]
+    Protocol(#[from] ProtocolViolation),
+    #[error("IO error")]
+    Io(#[from] io::Error),
 }
 
-impl From<prost_codec::Error> for UpgradeError {
-    fn from(error: prost_codec::Error) -> Self {
-        Self::Fatal(error.into())
+impl From<quick_protobuf_codec::Error> for Error {
+    fn from(error: quick_protobuf_codec::Error) -> Self {
+        Self::Protocol(ProtocolViolation::Codec(error))
     }
 }
 
 #[derive(Debug, Error)]
-pub enum FatalUpgradeError {
+pub(crate) enum ProtocolViolation {
     #[error(transparent)]
-    Codec(#[from] prost_codec::Error),
-    #[error("Stream closed")]
-    StreamClosed,
-    #[error("Failed to parse response type field.")]
-    ParseTypeField,
+    Codec(#[from] quick_protobuf_codec::Error),
     #[error("Failed to parse peer id.")]
     ParsePeerId,
     #[error("Expected 'peer' field to be set.")]
@@ -106,27 +87,27 @@ pub enum FatalUpgradeError {
     UnexpectedTypeStatus,
 }
 
-pub struct Circuit {
-    substream: Framed<NegotiatedSubstream, prost_codec::Codec<StopMessage>>,
+pub(crate) struct Circuit {
+    substream: Framed<Stream, quick_protobuf_codec::Codec<proto::StopMessage>>,
     src_peer_id: PeerId,
     limit: Option<protocol::Limit>,
 }
 
 impl Circuit {
-    pub fn src_peer_id(&self) -> PeerId {
+    pub(crate) fn src_peer_id(&self) -> PeerId {
         self.src_peer_id
     }
 
-    pub fn limit(&self) -> Option<protocol::Limit> {
+    pub(crate) fn limit(&self) -> Option<protocol::Limit> {
         self.limit
     }
 
-    pub async fn accept(mut self) -> Result<(NegotiatedSubstream, Bytes), UpgradeError> {
-        let msg = StopMessage {
-            r#type: stop_message::Type::Status.into(),
+    pub(crate) async fn accept(mut self) -> Result<(Stream, Bytes), Error> {
+        let msg = proto::StopMessage {
+            type_pb: proto::StopMessageType::STATUS,
             peer: None,
             limit: None,
-            status: Some(Status::Ok.into()),
+            status: Some(proto::Status::OK),
         };
 
         self.send(msg).await?;
@@ -145,18 +126,20 @@ impl Circuit {
         Ok((io, read_buffer.freeze()))
     }
 
-    pub async fn deny(mut self, status: Status) -> Result<(), UpgradeError> {
-        let msg = StopMessage {
-            r#type: stop_message::Type::Status.into(),
+    pub(crate) async fn deny(mut self, status: proto::Status) -> Result<(), Error> {
+        let msg = proto::StopMessage {
+            type_pb: proto::StopMessageType::STATUS,
             peer: None,
             limit: None,
-            status: Some(status.into()),
+            status: Some(status),
         };
 
-        self.send(msg).await.map_err(Into::into)
+        self.send(msg).await?;
+
+        Ok(())
     }
 
-    async fn send(&mut self, msg: StopMessage) -> Result<(), prost_codec::Error> {
+    async fn send(&mut self, msg: proto::StopMessage) -> Result<(), Error> {
         self.substream.send(msg).await?;
         self.substream.flush().await?;
 

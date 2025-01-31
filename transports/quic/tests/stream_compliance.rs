@@ -1,8 +1,11 @@
-use futures::channel::oneshot;
-use futures::StreamExt;
-use libp2p_core::Transport;
-use libp2p_quic as quic;
 use std::time::Duration;
+
+use futures::{channel::oneshot, StreamExt};
+use libp2p_core::{
+    transport::{DialOpts, ListenerId, PortUse},
+    Endpoint, Transport,
+};
+use libp2p_quic as quic;
 
 #[async_std::test]
 async fn close_implies_flush() {
@@ -23,7 +26,10 @@ async fn connected_peers() -> (quic::Connection, quic::Connection) {
     let mut listener = new_transport().boxed();
 
     listener
-        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+        .listen_on(
+            ListenerId::next(),
+            "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+        )
         .unwrap();
     let listen_address = listener.next().await.unwrap().into_new_address().unwrap();
 
@@ -43,7 +49,15 @@ async fn connected_peers() -> (quic::Connection, quic::Connection) {
             listener.next().await;
         }
     });
-    let dial_fut = dialer.dial(listen_address).unwrap();
+    let dial_fut = dialer
+        .dial(
+            listen_address,
+            DialOpts {
+                role: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+        )
+        .unwrap();
     async_std::task::spawn(async move {
         let connection = dial_fut.await.unwrap().1;
 
@@ -62,7 +76,7 @@ async fn connected_peers() -> (quic::Connection, quic::Connection) {
 }
 
 fn new_transport() -> quic::async_std::Transport {
-    let keypair = libp2p_core::identity::Keypair::generate_ed25519();
+    let keypair = libp2p_identity::Keypair::generate_ed25519();
     let mut config = quic::Config::new(&keypair);
     config.handshake_timeout = Duration::from_secs(1);
 
